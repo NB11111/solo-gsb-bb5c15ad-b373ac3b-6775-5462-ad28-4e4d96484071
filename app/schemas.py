@@ -51,6 +51,11 @@ class EncodeRequest(BaseModel):
     values: Dict[str, Any] = Field(default_factory=dict)
 
 
+class CompatibilityRequest(BaseModel):
+    old_version: str = Field(min_length=1, max_length=64)
+    new_version: str = Field(min_length=1, max_length=64)
+
+
 def validate_definition(defn: DefinitionCreate) -> None:
     """Cross-field semantic validation. Raises ValueError on problems."""
     if not defn.fields:

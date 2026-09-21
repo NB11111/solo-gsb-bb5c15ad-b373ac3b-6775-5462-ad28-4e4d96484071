@@ -68,6 +68,7 @@ docker compose up --build
 | GET  | `/api/v1/definitions/{device_type}/latest` | 查询该设备类型最新**启用**版本 |
 | GET  | `/api/v1/definitions/{device_type}/{version}` | 查询指定版本 |
 | POST | `/api/v1/definitions/{device_type}/{version}/deactivate` | 停用定义 |
+| POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合返回 422） |
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 
@@ -186,6 +187,71 @@ curl http://localhost:8000/api/v1/definitions/temp_sensor/latest
 curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/1.0.0/deactivate
 ```
 
+### 5. 版本兼容性分析
+
+比较同一 `device_type` 的两个**已注册**版本（无需提供报文）。分析器：
+
+1. 收集所有被条件引用的字段（控制字段），按条件中出现的整数常量把每个控制字段的原始值域划分为有限个**等价类**——同一等价类内的取值使该字段上的全部条件真假恒定（如 `eq 1` 分出 `[0] / [1] / [2..2ⁿ-1]`，`gt 5` 在 `6` 处切分）；
+2. 枚举各控制字段等价类代表值的笛卡尔积，对每个可达组合**模拟布局**：按条件保留/跳过字段，计算每个字段的位偏移与布局总长度（条件引用的字段被更早分支跳过时该组合不可达，自动跳过）；
+3. 对旧版每个可达布局，在新版的**相同条件代表值**下寻找对应布局：字段名称、类型、位宽、位偏移、总长度及校验算法必须全部一致。任一旧布局找不到对应布局即判为 `breaking`，逐分支返回差异；否则判为 `compatible`。
+
+等价类组合总数超过 **256** 时返回 `422`（边界值 256 正常分析）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/definitions/temp_sensor/compatibility \
+  -H 'Content-Type: application/json' \
+  -d '{"old_version": "1.0.0", "new_version": "2.0.0"}'
+```
+
+兼容时响应（节选）：
+
+```json
+{
+  "device_type": "temp_sensor",
+  "old_version": "1.0.0",
+  "new_version": "2.0.0",
+  "compatible": true,
+  "status": "compatible",
+  "equivalence_classes": [
+    {"field": "msg_type", "classes": 4, "representatives": [0, 1, 2, 3]}
+  ],
+  "combination_count": 4,
+  "reachable_branches": 4,
+  "unreachable_combinations": 0,
+  "breaking_branches": 0,
+  "branches": [
+    {
+      "representative": {"msg_type": {"op": "==", "value": 1}},
+      "compatible": true,
+      "old_layout": {
+        "fields": [
+          {"name": "header",      "type": "uint", "bit_length": 8,  "bit_offset": 0},
+          {"name": "msg_type",    "type": "uint", "bit_length": 4,  "bit_offset": 8},
+          {"name": "flags",       "type": "uint", "bit_length": 4,  "bit_offset": 12},
+          {"name": "temperature", "type": "int",  "bit_length": 16, "bit_offset": 16},
+          {"name": "crc",         "type": "uint", "bit_length": 16, "bit_offset": 32}
+        ],
+        "total_bits": 48,
+        "checksum_algorithm": "crc16-ccitt"
+      },
+      "new_layout": { "...": "结构相同..." }
+    }
+  ]
+}
+```
+
+发生破坏时，顶层 `"status"` 为 `"breaking"`、`"compatible"` 为 `false`，不兼容分支的 `"differences"` 逐项列出差异，`kind` 取值：
+
+| `kind` | 含义 |
+| ------ | ---- |
+| `field_added` / `field_removed` | 新版多出 / 删除了字段（含因新分支引入的字段） |
+| `field_changed` | 同名字段的 `type` / `bit_length` / `bit_offset` 变化 |
+| `total_length_changed` | 布局总位数变化 |
+| `checksum_algorithm_changed` | 校验算法变化（如 `crc16-ccitt` → `crc16-modbus`） |
+| `branch_unreachable` | 旧版可达分支在新版下条件无法满足（控制字段被跳过） |
+
+两版本对同一控制字段的位宽不同时，按两者原始值域的**交集**划分（无交集返回 422）；新版新增控制字段或删除旧控制字段时，仅在受影响的等价类上产生差异，未受影响分支仍可判为兼容。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -202,6 +268,7 @@ app/
   schemas.py    # 请求模型与定义语义校验
   parser.py     # 按位解析器（位读取、条件分支、校验和验证）
   encoder.py    # 按位编码器（位写入、scale/offset 反算、校验和自动写入）
+  analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对）
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
   database.py   # SQLite 持久化（启动自动建表）
 tests/test_api.py

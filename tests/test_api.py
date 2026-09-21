@@ -585,3 +585,253 @@ def test_encode_version_rules_match_parse():
     assert resp.status_code == 200, resp.text
     assert resp.json()["definition_active"] is False
     assert resp.json()["hex"] == "1234"
+
+
+# ---------------------------------------------------- version compatibility --
+
+
+def _compat(device_type, old, new):
+    return client.post(
+        f"/api/v1/definitions/{device_type}/compatibility",
+        json={"old_version": old, "new_version": new},
+    )
+
+
+def test_compatibility_identical_structure_compatible():
+    # temp_sensor 1.0.0 vs a re-registered copy under a new version
+    payload = dict(SENSOR_DEF)
+    payload["version"] = "1.1.0"
+    payload["description"] = "same wire format, new docs"
+    resp = client.post("/api/v1/definitions", json=payload)
+    assert resp.status_code == 201, resp.text
+
+    resp = _compat("temp_sensor", "1.0.0", "1.1.0")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["compatible"] is True
+    assert data["status"] == "compatible"
+    assert data["breaking_branches"] == 0
+    # msg_type is a 4-bit control field cut at 1,2 -> 4 equivalence classes
+    assert data["combination_count"] == 4
+    assert data["reachable_branches"] == 4
+    assert data["equivalence_classes"][0]["field"] == "msg_type"
+    assert data["equivalence_classes"][0]["representatives"] == [0, 1, 2, 3]
+
+    # every enumerated branch lays out fields with offsets and a total length
+    for branch in data["branches"]:
+        assert branch["compatible"] is True
+        layout = branch["old_layout"]
+        assert layout["total_bits"] == branch["new_layout"]["total_bits"]
+        assert layout["checksum_algorithm"] == "crc16-ccitt"
+        offsets = [f["bit_offset"] for f in layout["fields"]]
+        assert offsets == sorted(offsets)
+        assert all(f["bit_length"] > 0 for f in layout["fields"])
+
+    # the temperature branch (msg_type == 1) layout
+    temp_branch = next(
+        b for b in data["branches"]
+        if b["representative"]["msg_type"]["value"] == 1
+    )
+    names = [f["name"] for f in temp_branch["old_layout"]["fields"]]
+    assert names == ["header", "msg_type", "flags", "temperature", "crc"]
+    temp_field = next(f for f in temp_branch["old_layout"]["fields"] if f["name"] == "temperature")
+    assert (temp_field["type"], temp_field["bit_length"], temp_field["bit_offset"]) == (
+        "int", 16, 16,
+    )
+    assert temp_branch["old_layout"]["total_bits"] == 48
+
+
+def test_compatibility_field_width_change_is_breaking():
+    payload = {
+        "device_type": "compat_w",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "t", "type": "uint", "bit_length": 4},
+            {"name": "v", "type": "uint", "bit_length": 8,
+             "condition": {"field": "t", "op": "eq", "value": 1}},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+
+    new = {
+        "device_type": "compat_w",
+        "version": "2.0.0",
+        "fields": [
+            {"name": "t", "type": "uint", "bit_length": 4},
+            {"name": "v", "type": "uint", "bit_length": 16,
+             "condition": {"field": "t", "op": "eq", "value": 1}},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=new).status_code == 201
+
+    resp = _compat("compat_w", "1.0.0", "2.0.0")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["compatible"] is False
+    assert data["status"] == "breaking"
+    # t == 1 isolates a point, leaving one class above it -> 3 classes total;
+    # only the t == 1 branch contains v.
+    assert data["combination_count"] == 3
+    assert data["breaking_branches"] == 1
+
+    bad = next(
+        b for b in data["branches"]
+        if b["representative"]["t"]["value"] == 1
+    )
+    assert bad["compatible"] is False
+    kinds = {d["kind"]: d for d in bad["differences"]}
+    assert kinds["field_changed"]["field"] == "v"
+    assert kinds["field_changed"]["bit_length"] == {"old": 8, "new": 16}
+    assert kinds["total_length_changed"]["old"] == 12
+    assert kinds["total_length_changed"]["new"] == 20
+
+    # the other branches (t != 1) are unaffected and remain compatible
+    assert all(b["compatible"] for b in data["branches"]
+               if b["representative"]["t"]["value"] != 1)
+
+
+def test_compatibility_checksum_algorithm_change_is_breaking():
+    payload = {
+        "device_type": "compat_crc",
+        "version": "1.0.0",
+        "fields": [{"name": "crc", "type": "uint", "bit_length": 16}],
+        "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+    }
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+    new = dict(payload)
+    new["version"] = "2.0.0"
+    new["checksum"] = {"field": "crc", "algorithm": "crc16-modbus"}
+    assert client.post("/api/v1/definitions", json=new).status_code == 201
+
+    resp = _compat("compat_crc", "1.0.0", "2.0.0")
+    data = resp.json()
+    assert data["compatible"] is False
+    assert data["combination_count"] == 1  # no control fields -> one layout
+    diff = data["branches"][0]["differences"][0]
+    assert diff == {
+        "kind": "checksum_algorithm_changed",
+        "old": "crc16-ccitt",
+        "new": "crc16-modbus",
+    }
+    assert data["branches"][0]["old_layout"]["checksum_algorithm"] == "crc16-ccitt"
+
+
+def test_compatibility_new_version_adds_finer_branch_is_breaking_only_there():
+    base = {
+        "device_type": "compat_fine",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "t", "type": "uint", "bit_length": 4},
+            {"name": "v", "type": "uint", "bit_length": 8,
+             "condition": {"field": "t", "op": "eq", "value": 1}},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=base).status_code == 201
+    new = {
+        "device_type": "compat_fine",
+        "version": "2.0.0",
+        "fields": [
+            {"name": "t", "type": "uint", "bit_length": 4},
+            {"name": "v", "type": "uint", "bit_length": 8,
+             "condition": {"field": "t", "op": "eq", "value": 1}},
+            {"name": "w", "type": "uint", "bit_length": 8,
+             "condition": {"field": "t", "op": "eq", "value": 2}},
+        ],
+    }
+    assert client.post("/api/v1/definitions", json=new).status_code == 201
+
+    resp = _compat("compat_fine", "1.0.0", "2.0.0")
+    data = resp.json()
+    # eq 1 isolates one point and eq 2 another -> joint partition:
+    # [0], [1], [2], [3..15]
+    assert data["combination_count"] == 4
+    assert data["breaking_branches"] == 1
+    bad = next(
+        b for b in data["branches"]
+        if b["representative"]["t"]["value"] == 2
+    )
+    assert bad["compatible"] is False
+    assert any(d["kind"] == "field_added" and d["field"] == "w" for d in bad["differences"])
+    assert {
+        b["representative"]["t"]["value"]
+        for b in data["branches"] if b["compatible"]
+    } == {0, 1, 3}
+
+
+def test_compatibility_versions_missing_404_and_same_version_422():
+    resp = _compat("compat_missing", "1.0.0", "2.0.0")
+    assert resp.status_code == 404
+
+    resp = _compat("temp_sensor", "1.0.0", "9.9.9")
+    assert resp.status_code == 404
+
+    resp = _compat("temp_sensor", "1.0.0", "1.0.0")
+    assert resp.status_code == 422
+
+
+def test_compatibility_too_many_combinations_422():
+    # two independent uint9 control fields, each split into 17 classes -> 289
+    def payload(version):
+        fields = [{"name": "a", "type": "uint", "bit_length": 9}]
+        for i in range(16):
+            fields.append(
+                {"name": f"x{i}", "type": "uint", "bit_length": 8,
+                 "condition": {"field": "a", "op": "lt", "value": i + 1}}
+            )
+        fields.append({"name": "b", "type": "uint", "bit_length": 9})
+        for i in range(16):
+            fields.append(
+                {"name": f"y{i}", "type": "uint", "bit_length": 8,
+                 "condition": {"field": "b", "op": "lt", "value": i + 1}}
+            )
+        return {"device_type": "compat_big", "version": version, "fields": fields}
+
+    assert client.post("/api/v1/definitions", json=payload("1.0.0")).status_code == 201
+    assert client.post("/api/v1/definitions", json=payload("2.0.0")).status_code == 201
+
+    resp = _compat("compat_big", "1.0.0", "2.0.0")
+    assert resp.status_code == 422
+    assert "256" in resp.json()["detail"]
+
+
+def test_compatibility_nested_conditional_unreachable_combinations_skipped():
+    def payload(version):
+        return {
+            "device_type": "compat_nested",
+            "version": version,
+            "fields": [
+                {"name": "t", "type": "uint", "bit_length": 4},
+                {"name": "c1", "type": "uint", "bit_length": 8,
+                 "condition": {"field": "t", "op": "eq", "value": 1}},
+                # c2's control field c1 is itself conditional: when t != 1 the
+                # branch is unreachable and must not be compared.
+                {"name": "c2", "type": "uint", "bit_length": 8,
+                 "condition": {"field": "c1", "op": "gt", "value": 5}},
+            ],
+        }
+
+    assert client.post("/api/v1/definitions", json=payload("1.0.0")).status_code == 201
+    assert client.post("/api/v1/definitions", json=payload("2.0.0")).status_code == 201
+
+    resp = _compat("compat_nested", "1.0.0", "2.0.0")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # t partition [0],[1],[2..15] crossed with c1 classes {..5},{6..} = 6
+    # combos; only the t==1 ones are reachable (c1 is absent otherwise).
+    assert data["combination_count"] == 6
+    assert data["reachable_branches"] == 2
+    assert data["unreachable_combinations"] == 4
+    assert data["compatible"] is True
+    # only reachable combos (t == 1, c1 present) appear in the branch list
+    reps = {
+        (b["representative"]["t"]["value"], b["representative"]["c1"]["value"])
+        for b in data["branches"]
+    }
+    assert reps == {(1, 0), (1, 6)}
+    c2_branch = next(
+        b for b in data["branches"]
+        if b["representative"]["t"]["value"] == 1
+        and b["representative"]["c1"]["value"] == 6
+    )
+    assert [f["name"] for f in c2_branch["old_layout"]["fields"]] == ["t", "c1", "c2"]
+    assert c2_branch["old_layout"]["total_bits"] == 20

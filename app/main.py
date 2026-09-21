@@ -7,9 +7,16 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 
 from . import database
+from .analyzer import CompatibilityError, analyze_compatibility
 from .encoder import EncodeError, encode_message
 from .parser import ParseError, parse_message
-from .schemas import DefinitionCreate, EncodeRequest, ParseRequest, validate_definition
+from .schemas import (
+    CompatibilityRequest,
+    DefinitionCreate,
+    EncodeRequest,
+    ParseRequest,
+    validate_definition,
+)
 
 
 @asynccontextmanager
@@ -107,6 +114,38 @@ def deactivate_definition(device_type: str, version: str):
             detail=f"definition '{device_type}' version '{version}' not found",
         )
     return record
+
+
+@app.post("/api/v1/definitions/{device_type}/compatibility")
+def compatibility(device_type: str, req: CompatibilityRequest):
+    """Analyze wire compatibility between two registered versions of the same
+    device type. Conditions are partitioned into finite equivalence classes,
+    reachable layouts (field bit offsets + total length) are enumerated, and
+    each old-version layout must find a new-version layout with identical
+    field names/types/bit widths/offsets, total length and checksum algorithm.
+    Returns ``breaking`` with per-branch differences otherwise; more than 256
+    equivalence-class combinations yields 422."""
+    if req.old_version == req.new_version:
+        raise HTTPException(
+            status_code=422,
+            detail="old_version and new_version must differ",
+        )
+    old_record = database.get_definition(device_type, req.old_version)
+    if old_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"definition '{device_type}' version '{req.old_version}' not found",
+        )
+    new_record = database.get_definition(device_type, req.new_version)
+    if new_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"definition '{device_type}' version '{req.new_version}' not found",
+        )
+    try:
+        return analyze_compatibility(old_record, new_record)
+    except CompatibilityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 _HEX_CLEANER = re.compile(r"(0[xX])|[\s_-]")

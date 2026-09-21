@@ -7,9 +7,16 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 
 from . import database
+from .compat import MAX_COMBINATIONS, CompatibilityError, analyze_versions
 from .encoder import EncodeError, encode_message
 from .parser import ParseError, parse_message
-from .schemas import DefinitionCreate, EncodeRequest, ParseRequest, validate_definition
+from .schemas import (
+    CompatibilityRequest,
+    DefinitionCreate,
+    EncodeRequest,
+    ParseRequest,
+    validate_definition,
+)
 
 
 @asynccontextmanager
@@ -130,6 +137,48 @@ def _select_definition(device_type: str, version: Optional[str]) -> dict:
                 detail=f"no active definition found for device type '{device_type}'",
             )
     return record
+
+
+@app.post("/api/v1/definitions/{device_type}/compatibility")
+def analyze_compatibility(device_type: str, req: CompatibilityRequest):
+    """Statically compare two registered versions of a device type.
+
+    Conditional constants partition the controlling fields into finite
+    equivalence classes; every reachable branch is enumerated and its fields
+    laid out (bit offsets + total length). The verdict is ``breaking`` when an
+    old-version branch has no field-for-field match (name, type, bit width,
+    offset, total length, checksum algorithm) in the new version at the same
+    representative values, otherwise ``compatible``. Both versions may be
+    inactive; they must be explicitly registered."""
+    old_record = database.get_definition(device_type, req.old_version)
+    if old_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"definition '{device_type}' version '{req.old_version}' not found",
+        )
+    new_record = database.get_definition(device_type, req.new_version)
+    if new_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"definition '{device_type}' version '{req.new_version}' not found",
+        )
+
+    try:
+        report = analyze_versions(
+            old_fields=old_record["fields"],
+            old_checksum=old_record["checksum"],
+            new_fields=new_record["fields"],
+            new_checksum=new_record["checksum"],
+        )
+    except CompatibilityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "device_type": device_type,
+        "old_version": req.old_version,
+        "new_version": req.new_version,
+        **report,
+    }
 
 
 @app.post("/api/v1/parse")

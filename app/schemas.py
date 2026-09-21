@@ -42,6 +42,11 @@ class ParseRequest(BaseModel):
     hex: str = Field(min_length=2)
 
 
+class CompatibilityRequest(BaseModel):
+    old_version: str = Field(min_length=1, max_length=64)
+    new_version: str = Field(min_length=1, max_length=64)
+
+
 class EncodeRequest(BaseModel):
     device_type: str
     version: Optional[str] = None  # omitted -> latest active version
